@@ -1,8 +1,8 @@
 # ficsit.app listing for Pogo Stick 1.0.0
 
-## Short description (listing, max ~200 characters)
+## Short description (listing, max 128 characters)
 
-An equippable Pogo Stick: charge it, push off the surface you're looking at, and launch the opposite way. Bounces on hard landings. Fully configurable.
+A Pogo Stick: charge it, push off the surface you're looking at and launch the other way. Bounces on hard landings. Adjustable.
 
 ## Full description (mod page, Markdown)
 
