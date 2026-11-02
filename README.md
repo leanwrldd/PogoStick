@@ -1,5 +1,7 @@
 # Pogo Stick
 
+<img src="logo.png" alt="Pogo Stick logo" width="256">
+
 A [Satisfactory](https://www.satisfactorygame.com/) mod that adds an equippable Pogo Stick.
 Charge it, push off the surface you're looking at, and launch the opposite way.
 
