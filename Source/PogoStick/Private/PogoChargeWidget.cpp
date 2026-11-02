@@ -4,17 +4,41 @@
 #include "Components/Border.h"
 #include "Components/CanvasPanel.h"
 #include "Components/CanvasPanelSlot.h"
-#include "Components/ProgressBar.h"
 #include "Components/TextBlock.h"
 
 namespace
 {
-const FLinearColor ChargingColor = FLinearColor::FromSRGBColor(FColor(245, 155, 45));
 const FLinearColor FullColor = FLinearColor::FromSRGBColor(FColor(120, 230, 90));
-const FLinearColor NoSurfaceColor = FLinearColor::FromSRGBColor(FColor(110, 110, 110));
 const FLinearColor OutOfRangeMarkerColor = FLinearColor::FromSRGBColor(FColor(230, 70, 60));
 
+const FLinearColor CooldownColor = FLinearColor::FromSRGBColor(FColor(245, 155, 45));
+const FLinearColor ChargedNoSurfaceColor = FLinearColor::FromSRGBColor(FColor(30, 115, 255));
+
 constexpr float MarkerSize = 10.0f;
+
+// Like the Grappling Hook's in-reach indicator: two corners of a hexagon a little larger than
+// the game's hexagonal crosshair (pointy end up), one top-left and its mirror bottom-right.
+// Each runs part way along the slanted top edge, round the corner and down the side.
+constexpr float BowHexRadius = 21.0f; // centre to corner, at the middle of the stroke
+constexpr float BowWidth = 3.0f;
+constexpr float BowSlantedFraction = 0.6f; // of the slanted edge, measured from the corner
+constexpr float BowSideFraction = 0.7f; // of the vertical side, measured from the corner
+// Each bow is filled with thin strokes along concentric hexagons rather than one thick
+// polyline, so the ends come out square instead of pointed.
+constexpr int32 BowStrokes = 4;
+
+FLinearColor GetCrosshairColor(EPogoCrosshairState State)
+{
+	switch (State)
+	{
+	case EPogoCrosshairState::Ready:
+		return FullColor;
+	case EPogoCrosshairState::ChargedNoSurface:
+		return ChargedNoSurfaceColor;
+	default:
+		return CooldownColor;
+	}
+}
 }
 
 void UPogoChargeWidget::NativeOnInitialized()
@@ -28,17 +52,6 @@ void UPogoChargeWidget::NativeOnInitialized()
 
 	UCanvasPanel* canvas = WidgetTree->ConstructWidget<UCanvasPanel>(UCanvasPanel::StaticClass(), TEXT("Canvas"));
 	WidgetTree->RootWidget = canvas;
-
-	Bar = WidgetTree->ConstructWidget<UProgressBar>(UProgressBar::StaticClass(), TEXT("ChargeBar"));
-	Bar->SetFillColorAndOpacity(ChargingColor);
-	Bar->SetPercent(0.0f);
-
-	// Centred, a little below the crosshair.
-	UCanvasPanelSlot* barSlot = canvas->AddChildToCanvas(Bar);
-	barSlot->SetAnchors(FAnchors(0.5f, 0.5f));
-	barSlot->SetAlignment(FVector2D(0.5f, 0.0f));
-	barSlot->SetPosition(FVector2D(0.0f, 48.0f));
-	barSlot->SetSize(FVector2D(180.0f, 8.0f));
 
 	// The push-off point. Positioned in absolute widget space each tick, so anchored top-left.
 	Marker = WidgetTree->ConstructWidget<UBorder>(UBorder::StaticClass(), TEXT("PushPointMarker"));
@@ -60,26 +73,59 @@ void UPogoChargeWidget::NativeOnInitialized()
 	labelSlot->SetAutoSize(true);
 
 	SetVisibility(ESlateVisibility::HitTestInvisible);
-	SetChargeVisible(false);
 	SetPushPoint(false, FVector2D::ZeroVector, 0.0f, false);
 }
 
-void UPogoChargeWidget::SetCharge(float Alpha, bool bSurfaceInRange)
+void UPogoChargeWidget::SetCrosshairState(EPogoCrosshairState State)
 {
-	if (Bar == nullptr)
+	if (State == ShownCrosshairState)
 	{
 		return;
 	}
-	Bar->SetPercent(Alpha);
-	Bar->SetFillColorAndOpacity(!bSurfaceInRange ? NoSurfaceColor : Alpha >= 1.0f ? FullColor : ChargingColor);
+	ShownCrosshairState = State;
+	Invalidate(EInvalidateWidgetReason::Paint);
 }
 
-void UPogoChargeWidget::SetChargeVisible(bool bVisible)
+int32 UPogoChargeWidget::NativePaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry, const FSlateRect& MyCullingRect,
+	FSlateWindowElementList& OutDrawElements, int32 LayerId, const FWidgetStyle& InWidgetStyle, bool bParentEnabled) const
 {
-	if (Bar != nullptr)
+	LayerId = Super::NativePaint(Args, AllottedGeometry, MyCullingRect, OutDrawElements, LayerId, InWidgetStyle, bParentEnabled);
+	if (ShownCrosshairState == EPogoCrosshairState::None)
 	{
-		Bar->SetVisibility(bVisible ? ESlateVisibility::HitTestInvisible : ESlateVisibility::Collapsed);
+		return LayerId;
 	}
+
+	const FVector2f center = FVector2f(AllottedGeometry.GetLocalSize()) * 0.5f;
+	const FLinearColor color = GetCrosshairColor(ShownCrosshairState);
+
+	// The top-left bow on a unit hexagon (screen space, y down): top corner, upper-left corner,
+	// lower-left corner.
+	const float halfWidth = FMath::Cos(FMath::DegreesToRadians(30.0f));
+	const FVector2f top(0.0f, -1.0f);
+	const FVector2f upperLeft(-halfWidth, -0.5f);
+	const FVector2f lowerLeft(-halfWidth, 0.5f);
+	const FVector2f bow[] = {
+		upperLeft + (top - upperLeft) * BowSlantedFraction,
+		upperLeft,
+		upperLeft + (lowerLeft - upperLeft) * BowSideFraction,
+	};
+
+	const float strokeSpacing = BowWidth / BowStrokes;
+	for (const float side : { 1.0f, -1.0f }) // -1 turns it half round into the bottom-right bow
+	{
+		for (int32 stroke = 0; stroke < BowStrokes; ++stroke)
+		{
+			const float radius = BowHexRadius - BowWidth * 0.5f + strokeSpacing * (stroke + 0.5f);
+			TArray<FVector2f> points;
+			for (const FVector2f& point : bow)
+			{
+				points.Add(center + point * side * radius);
+			}
+			FSlateDrawElement::MakeLines(OutDrawElements, LayerId + 1, AllottedGeometry.ToPaintGeometry(), MoveTemp(points),
+				ESlateDrawEffect::None, color, true, strokeSpacing + 0.5f);
+		}
+	}
+	return LayerId + 1;
 }
 
 void UPogoChargeWidget::SetPushPoint(bool bHit, const FVector2D& ScreenPosition, float DistanceMeters, bool bInRange, bool bShowDistance)

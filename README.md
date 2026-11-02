@@ -27,14 +27,14 @@ Built with [SML](https://ficsit.app/mod/SML) (Satisfactory Mod Loader).
 
 | Setting | Description | Default |
 | --- | --- | --- |
-| Charge Time | Seconds Primary Fire must be held for a full charge | 2 s |
+| Charge Time | Seconds Primary Fire must be held for a full charge | 1 s |
 | Launch Strength | How fast a full charge launches you | 25 m/s |
 | Push-Off Range | How close the surface you're looking at must be. Standing up, the floor is about 1.7 m away | 3.5 m |
 | Cooldown | Seconds after a launch before you can charge again | 0.5 s |
 | Keep Momentum | Adds the launch to your current speed instead of replacing it | Off |
 | Launch When Fully Charged | Launch the moment the charge completes, instead of on release | On |
 | No Fall Damage After Launch | No fall damage until your next landing | On |
-| Spring Squash | How much the spring visibly squashes at full charge | 0.5 |
+| Spring Squash | How much the spring visibly squashes at full charge | 1 |
 | Bounce On Landing | Bounce back up from hard landings while looking at the ground | On |
 | Bounciness | Fraction of landing speed a bounce gives back. 1 = bounce forever | 0.8 |
 | Minimum Bounce Speed | Slower landings don't bounce | 12 m/s |

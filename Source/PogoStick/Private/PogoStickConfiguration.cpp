@@ -123,11 +123,11 @@ UPogoStickConfiguration::UPogoStickConfiguration(const FObjectInitializer& Objec
 		TEXT("If enabled, you launch the moment the charge completes. If disabled, a full charge is held until you let go, so you can aim first. Letting go early always cancels."),
 		defaults.bAutoLaunch);
 	AddBoolProperty(root, TEXT("NoFallDamage"), TEXT("No Fall Damage After Launch"),
-		TEXT("If enabled, you take no fall damage between a launch and your next landing."),
+		TEXT("If enabled, you take no fall damage between a launch and your next landing, as long as the Pogo Stick stays equipped."),
 		defaults.bNoFallDamage);
 	AddFloatProperty(root, TEXT("SpringCompression"), TEXT("Spring Squash (visual)"),
-		TEXT("How much the spring visibly squashes at full charge. 0 = not at all, 0.9 = almost flat."),
-		defaults.SpringCompression, 0.0f, 0.9f);
+		TEXT("How much the spring visibly squashes at full charge. 0 = not at all, 1 = fully flat."),
+		defaults.SpringCompression, 0.0f, 1.0f);
 	AddBoolProperty(root, TEXT("BounceOnLanding"), TEXT("Bounce On Landing"),
 		TEXT("If enabled, landing hard with the Pogo Stick equipped bounces you back up instead of hurting you, as long as you're looking at the ground (within Push-Off Range) as you land. Hold Primary Fire or crouch as you land to stop bouncing."),
 		defaults.bBounceOnLanding);
@@ -143,6 +143,9 @@ UPogoStickConfiguration::UPogoStickConfiguration(const FObjectInitializer& Objec
 	AddBoolProperty(root, TEXT("ShowPushDistance"), TEXT("Show Push-Off Distance"),
 		TEXT("If enabled, the distance to the push-off point is shown next to its marker. Has no effect while Show Push-Off Point is disabled."),
 		defaults.bShowPushDistance);
+	AddBoolProperty(root, TEXT("ShowCrosshairIndicator"), TEXT("Show Crosshair Ring"),
+		TEXT("If enabled, a ring appears around the crosshair: green while a surface is within Push-Off Range, blue when fully charged with no surface in range, orange during the cooldown."),
+		defaults.bShowCrosshairIndicator);
 
 	// Hold position: tuned live in game while looking at the stick, then baked in as defaults.
 	UCP_Section* hold = NewObject<UCP_Section>(root, GetConfigPropertySectionClass(), TEXT("Hold"));
@@ -192,12 +195,13 @@ FPogoStickSettings FPogoStickSettings::Read(const UObject* WorldContext)
 	settings.bKeepMomentum = ReadBool(root, TEXT("KeepMomentum"), settings.bKeepMomentum);
 	settings.bAutoLaunch = ReadBool(root, TEXT("AutoLaunch"), settings.bAutoLaunch);
 	settings.bNoFallDamage = ReadBool(root, TEXT("NoFallDamage"), settings.bNoFallDamage);
-	settings.SpringCompression = FMath::Clamp(ReadFloat(root, TEXT("SpringCompression"), settings.SpringCompression), 0.0f, 0.9f);
+	settings.SpringCompression = FMath::Clamp(ReadFloat(root, TEXT("SpringCompression"), settings.SpringCompression), 0.0f, 1.0f);
 	settings.bBounceOnLanding = ReadBool(root, TEXT("BounceOnLanding"), settings.bBounceOnLanding);
 	settings.Bounciness = FMath::Clamp(ReadFloat(root, TEXT("Bounciness"), settings.Bounciness), 0.0f, 1.5f);
 	settings.MinBounceSpeed = FMath::Max(1.0f, ReadFloat(root, TEXT("MinBounceSpeed"), settings.MinBounceSpeed));
 	settings.bShowPushPoint = ReadBool(root, TEXT("ShowPushPoint"), settings.bShowPushPoint);
 	settings.bShowPushDistance = ReadBool(root, TEXT("ShowPushDistance"), settings.bShowPushDistance);
+	settings.bShowCrosshairIndicator = ReadBool(root, TEXT("ShowCrosshairIndicator"), settings.bShowCrosshairIndicator);
 
 	if (const UConfigPropertySection* hold = Cast<UConfigPropertySection>(root->SectionProperties.FindRef(TEXT("Hold"))))
 	{

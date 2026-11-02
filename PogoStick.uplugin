@@ -1,7 +1,7 @@
 {
 	"FileVersion": 3,
 	"Version": 1,
-	"VersionName": "1.0.0",
+	"VersionName": "1.1.0",
 	"FriendlyName": "Pogo Stick",
 	"Description": "Adds an equippable Pogo Stick, unlocked with the Jump Pads milestone and crafted in the Equipment Workshop. Hold Primary Fire to charge it. Once fully charged it pushes off the surface you're looking at, if that surface is close enough, and launches you the opposite way: look down to bounce up, at a wall to fly sideways. Hard landings bounce you back up while you look at the ground, and launches can skip fall damage. Charge time, launch strength, range, bounciness, HUD and hold position are all adjustable in the mod settings.",
 	"Category": "Modding",
@@ -29,6 +29,6 @@
 			"SemVersion": "^3.12.0"
 		}
 	],
-	"SemVersion": "1.0.0",
+	"SemVersion": "1.1.0",
 	"GameVersion": ">=491125"
 }

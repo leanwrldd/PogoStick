@@ -2,6 +2,9 @@
 
 #include "AkAudioEvent.h"
 #include "AkGameplayStatics.h"
+#include "Animation/AnimInstance.h"
+#include "Animation/AnimMontage.h"
+#include "Animation/AnimSequence.h"
 #include "Components/AudioComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Curves/CurveFloat.h"
@@ -11,6 +14,7 @@
 #include "FGPlayerController.h"
 #include "Blueprint/WidgetLayoutLibrary.h"
 #include "Kismet/GameplayStatics.h"
+#include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialInterface.h"
 #include "PogoChargeWidget.h"
 #include "PogoStick.h"
@@ -18,6 +22,7 @@
 #include "PogoStickConfiguration.h"
 #include "Sound/SoundBase.h"
 #include "UObject/UnrealType.h"
+#include "Components/SkeletalMeshComponent.h"
 
 namespace
 {
@@ -29,16 +34,32 @@ namespace
 constexpr EArmEquipment FirstPersonArmAnimation = EArmEquipment::AE_RebarGun;
 constexpr EArmEquipment ThirdPersonArmAnimation = EArmEquipment::AE_OneHandEquipment;
 
+// First person: the stick hangs off the arms' ArmBase bone, which is the camera pivot (it pitches
+// with the view and both arms hang from it), so it stays in the middle of the view and the hold
+// animation's hands stay on its grips. In ArmBase space +X is left, +Y forward, +Z up, in cm.
+// Tools/make_charge_anim.py bakes the hands for these same numbers; change both together.
+const FName FirstPersonHoldBone = TEXT("ArmBase");
+const FVector FirstPersonHandlebarCentre(0.0f, 38.0f, -12.0f);
+constexpr float FirstPersonShaftTilt = 20.0f; // degrees, foot forward
+const FVector FirstPersonChargePush(0.0f, 6.0f, -5.0f);
+/// How fast the pushed-in stick comes back up after a launch or cancel, per second.
+constexpr float ChargePushReturnRate = 4.0f;
+
 /// Upper bound the server accepts from a client, in cm/s, so a modified client can't fling
 /// itself across the map. Matches the config's 200 m/s maximum.
 constexpr float MaxAcceptedLaunchSpeed = 200.0f * 100.0f;
 
-/// The charge sound is authored for the default charge time and pitched to match others.
-constexpr float AuthoredChargeTime = 2.0f;
-
 /// Grace period before the server starts checking for a landing. The launch tick itself can
 /// still report the player as on the ground.
 constexpr float MinAirborneTime = 0.2f;
+
+const TCHAR* NoFallDamageCurveName = TEXT("PogoNoFallDamage");
+
+/// Any Pogo Stick's no-fall-damage curve, not just this stick's: each stick makes its own.
+bool IsNoFallDamageCurve(const UObject* Curve)
+{
+	return Curve != nullptr && Curve->GetFName() == FName(NoFallDamageCurveName);
+}
 
 FObjectProperty* GetFallDamageOverrideProperty()
 {
@@ -114,27 +135,239 @@ void APogoStickEquipment::OnCameraModeChanged_Implementation(ECameraMode newCame
 void APogoStickEquipment::UpdateArmAnimation(ECameraMode CameraMode)
 {
 	// Other players only ever see the third-person mesh.
-	mArmAnimation = IsLocalInstigator() && CameraMode == ECameraMode::ECM_FirstPerson
+	mArmAnimation = IsLocalInstigator() && CameraMode == ECameraMode::ECM_FirstPerson && !IsThirdPersonBodyShown()
 		? FirstPersonArmAnimation : ThirdPersonArmAnimation;
 }
 
-void APogoStickEquipment::UpdateHoldAdjust(const FPogoStickSettings& Settings)
+bool APogoStickEquipment::IsThirdPersonBodyShown() const
 {
-	// The parts are laid out with the grip at HoldAdjust's origin, so scaling here shrinks the
-	// stick around the hand.
-	const FTransform hold(Settings.HoldRotation, Settings.HoldOffset, FVector(Settings.HoldScale));
+	// Photo mode shows the third-person body while the camera mode still says first person.
+	const AFGCharacterPlayer* player = GetInstigatorCharacter();
+	return player != nullptr && player->Get3PMesh() != nullptr && player->Get3PMesh()->IsVisible();
+}
+
+void APogoStickEquipment::RegisterFirstPersonMaterials()
+{
+	UMaterialInterface* parent = LoadOptional<UMaterialInterface>(PogoStickAssets::FirstPersonParentMaterial);
+	UTexture* baseColor = LoadOptional<UTexture>(PogoStickAssets::BaseColorTexture);
+	UTexture* normal = LoadOptional<UTexture>(PogoStickAssets::NormalTexture);
+	UTexture* orm = LoadOptional<UTexture>(PogoStickAssets::OrmTexture);
+	if (parent == nullptr || baseColor == nullptr || normal == nullptr || orm == nullptr)
+	{
+		return;
+	}
+
+	UMaterialInstanceDynamic* material = UMaterialInstanceDynamic::Create(parent, this, TEXT("MID_PogoStick_1p"));
+
+	// The parent's parameter names aren't documented, so match them by name and log them all, so
+	// a wrong guess shows up in the game log.
+	TArray<FMaterialParameterInfo> infos;
+	TArray<FGuid> ids;
+	parent->GetAllTextureParameterInfo(infos, ids);
+	int32 assigned = 0;
+	for (const FMaterialParameterInfo& info : infos)
+	{
+		const FString name = info.Name.ToString();
+		UTexture* current = nullptr;
+		parent->GetTextureParameterValue(info, current);
+		UTexture* replacement = nullptr;
+		if (name.Contains(TEXT("Normal")))
+		{
+			replacement = normal;
+		}
+		else if (name.Contains(TEXT("Albedo")) || name.Contains(TEXT("BaseColor")) || name.Contains(TEXT("Diffuse"))
+			|| name.Contains(TEXT("Color")))
+		{
+			replacement = baseColor;
+		}
+		else if (name.Contains(TEXT("ORM")) || name.Contains(TEXT("MRAO")) || name.Contains(TEXT("Roughness"))
+			|| name.Contains(TEXT("Metal")) || name.Contains(TEXT("Mask")))
+		{
+			replacement = orm;
+		}
+		if (replacement != nullptr)
+		{
+			material->SetTextureParameterValueByInfo(info, replacement);
+			++assigned;
+		}
+		UE_LOG(LogPogoStick, Log, TEXT("1p material texture '%s' (was %s) -> %s"),
+			*name, *GetNameSafe(current), *GetNameSafe(replacement));
+	}
+	TArray<FMaterialParameterInfo> scalarInfos;
+	parent->GetAllScalarParameterInfo(scalarInfos, ids);
+	TArray<FMaterialParameterInfo> vectorInfos;
+	parent->GetAllVectorParameterInfo(vectorInfos, ids);
+	TArray<FString> otherNames;
+	for (const FMaterialParameterInfo& info : scalarInfos)
+	{
+		otherNames.Add(FString::Printf(TEXT("scalar %s"), *info.Name.ToString()));
+	}
+	for (const FMaterialParameterInfo& info : vectorInfos)
+	{
+		otherNames.Add(FString::Printf(TEXT("vector %s"), *info.Name.ToString()));
+	}
+	UE_LOG(LogPogoStick, Log, TEXT("1p material other parameters: %s"), *FString::Join(otherNames, TEXT(", ")));
+
+	if (assigned == 0)
+	{
+		UE_LOG(LogPogoStick, Warning, TEXT("No texture parameter matched on %s; keeping the plain material in first person."), *parent->GetName());
+		return;
+	}
+
+	// The game swaps these in while the holder is in first person and back out in third person.
+	for (UStaticMeshComponent* part : {BodyMesh.Get(), SpringMesh.Get(), FootMesh.Get()})
+	{
+		TArray<UMaterialInterface*> materials;
+		materials.Init(material, FMath::Max(1, part->GetNumMaterials()));
+		AddFirstPersonComponentAndMaterialsEntry(part->GetFName(), materials);
+	}
+	UE_LOG(LogPogoStick, Log, TEXT("Registered first-person materials (%d texture parameter(s) set)."), assigned);
+}
+
+void APogoStickEquipment::UpdateChargeAim(const FPogoStickSettings& Settings, float DeltaSeconds)
+{
+	// Eases in while charging and back out after the launch or cancel.
+	AimBlend = FMath::FInterpConstantTo(AimBlend, bCharging ? 1.0f : 0.0f, DeltaSeconds, 1.0f / AimBlendTime);
+	const AFGCharacterPlayer* player = GetInstigatorCharacter();
+	if (AimBlend <= 0.0f || player == nullptr)
+	{
+		return;
+	}
+
+	// Aim at the push-off point, or straight along the view when nothing is in sight, using the
+	// same longer trace as the HUD marker so the stick and the marker agree.
+	FVector launchDirection;
+	FHitResult hit;
+	FindPushSurface(Settings, launchDirection, &hit, 3.0f);
+	FVector eyeLocation;
+	FRotator viewRotation;
+	player->GetActorEyesViewPoint(eyeLocation, viewRotation);
+	const FVector target = hit.bBlockingHit ? FVector(hit.ImpactPoint)
+		: eyeLocation + viewRotation.Vector() * Settings.MaxSurfaceDistance * 300.0f;
+
+	// The stick runs down -Z from the right grip at HoldAdjust's origin, with the handlebar along
+	// Y. It only turns around the handlebar, so both grips stay in the hands: the charge animation
+	// puts the left hand on the left grip.
+	const FVector grip = HoldAdjust->GetComponentLocation();
+	const FQuat holdRotation = HoldAdjust->GetComponentQuat();
+	const FVector handlebar = holdRotation.GetRightVector();
+	const FVector aimDirection = FVector::VectorPlaneProject(target - grip, handlebar).GetSafeNormal();
+	if (aimDirection.IsNearlyZero())
+	{
+		return;
+	}
+	const FVector down = -holdRotation.GetUpVector();
+	const float angle = FMath::Atan2(FVector::DotProduct(FVector::CrossProduct(down, aimDirection), handlebar),
+		FVector::DotProduct(down, aimDirection));
+	const FQuat aimed = FQuat(handlebar, angle) * holdRotation;
+	const float alpha = FMath::InterpEaseInOut(0.0f, 1.0f, AimBlend, 2.0f);
+	HoldAdjust->SetWorldRotation(FQuat::Slerp(holdRotation, aimed, alpha));
+}
+
+void APogoStickEquipment::UpdateHold(const FPogoStickSettings& Settings, float DeltaSeconds)
+{
+	AFGCharacterPlayer* player = GetInstigatorCharacter();
+	USkeletalMeshComponent* mesh = player != nullptr ? player->GetMesh() : nullptr;
+	UAnimInstance* anim = mesh != nullptr ? mesh->GetAnimInstance() : nullptr;
+	const bool bThirdPersonBody = IsThirdPersonBodyShown();
+	const bool bFirstPerson = anim != nullptr && ChargeAnimation != nullptr && IsLocalInstigator()
+		&& GetInstigatorCameraMode() == ECameraMode::ECM_FirstPerson && !bThirdPersonBody;
+	if (!bFirstPerson)
+	{
+		ReleaseFirstPersonHold();
+		// Third person: the stick hangs from the hand socket, placed by the Hold settings. The parts
+		// are laid out with the right grip at HoldAdjust's origin, so scaling shrinks it around the hand.
+		FTransform hold(Settings.HoldRotation, Settings.HoldOffset, FVector(Settings.HoldScale));
+		if (bThirdPersonBody && GetInstigatorCameraMode() == ECameraMode::ECM_FirstPerson)
+		{
+			// Photo mode: the game leaves the equipment on the hidden first-person hand, so the
+			// stick moves to the same socket on the body, keeping the root's offset from it.
+			USkeletalMeshComponent* body = player->Get3PMesh();
+			if (HoldAdjust->GetAttachParent() != body)
+			{
+				HoldAdjust->AttachToComponent(body, FAttachmentTransformRules::KeepRelativeTransform, mAttachSocket);
+			}
+			hold = hold * GetRootComponent()->GetRelativeTransform();
+		}
+		if (!HoldAdjust->GetRelativeTransform().Equals(hold))
+		{
+			HoldAdjust->SetRelativeTransform(hold);
+		}
+		return;
+	}
+
+	// The push follows the charge, eased, and springs back afterwards.
+	const float charge = bCharging ? FMath::Clamp(ChargeElapsed / FMath::Max(0.1f, ActiveChargeTime), 0.0f, 1.0f) : 0.0f;
+	const float target = FMath::SmoothStep(0.0f, 1.0f, charge);
+	ChargePush = bCharging ? target : FMath::FInterpConstantTo(ChargePush, target, DeltaSeconds, ChargePushReturnRate);
+
+	if (HoldAdjust->GetAttachParent() != mesh || HoldAdjust->GetAttachSocketName() != FirstPersonHoldBone)
+	{
+		HoldAdjust->AttachToComponent(mesh, FAttachmentTransformRules::KeepRelativeTransform, FirstPersonHoldBone);
+	}
+	// HoldAdjust's origin is the right grip, its +Y runs from the left grip to the right one and the
+	// shaft runs down -Z. The right side is -X here.
+	const float tilt = FMath::DegreesToRadians(FirstPersonShaftTilt);
+	const FVector handlebar(-1.0f, 0.0f, 0.0f);
+	const FVector up(0.0f, -FMath::Sin(tilt), FMath::Cos(tilt));
+	const FVector rightGrip = FirstPersonHandlebarCentre + FirstPersonChargePush * ChargePush
+		+ handlebar * PogoStickAssets::RightGripOffset.Y * Settings.HoldScale;
+	const FTransform hold(FRotationMatrix::MakeFromYZ(handlebar, up).ToQuat(), rightGrip, FVector(Settings.HoldScale));
 	if (!HoldAdjust->GetRelativeTransform().Equals(hold))
 	{
 		HoldAdjust->SetRelativeTransform(hold);
+	}
+
+	// Both hands on the grips: the hold animation, frozen at the frame matching the push. Played
+	// again whenever something else in the slot (an emote, say) has replaced it.
+	if (ChargeMontage == nullptr || !anim->Montage_IsPlaying(ChargeMontage))
+	{
+		ChargeMontage = anim->PlaySlotAnimationAsDynamicMontage(ChargeAnimation, PogoStickAssets::ChargeAnimationSlot,
+			HoldBlendTime, HoldBlendTime);
+		if (ChargeMontage != nullptr)
+		{
+			ChargeMontage->bEnableAutoBlendOut = false;
+			anim->Montage_SetPlayRate(ChargeMontage, 0.0f);
+		}
+	}
+	if (ChargeMontage != nullptr)
+	{
+		// Kept short of the very end, which would finish the montage.
+		const float length = ChargeMontage->GetPlayLength();
+		anim->Montage_SetPosition(ChargeMontage, FMath::Min(ChargePush * length, length - 0.01f));
+	}
+}
+
+void APogoStickEquipment::ReleaseFirstPersonHold()
+{
+	const AFGCharacterPlayer* player = GetInstigatorCharacter();
+	const bool bOnBody = player != nullptr && HoldAdjust->GetAttachParent() == player->Get3PMesh() && IsThirdPersonBodyShown()
+		&& GetInstigatorCameraMode() == ECameraMode::ECM_FirstPerson;
+	if (HoldAdjust->GetAttachParent() != Root && !bOnBody)
+	{
+		HoldAdjust->AttachToComponent(Root, FAttachmentTransformRules::KeepRelativeTransform);
+	}
+	ChargePush = 0.0f;
+	if (ChargeMontage != nullptr)
+	{
+		UAnimInstance* anim = player != nullptr && player->GetMesh() != nullptr ? player->GetMesh()->GetAnimInstance() : nullptr;
+		if (anim != nullptr)
+		{
+			anim->Montage_Stop(HoldBlendTime, ChargeMontage);
+		}
+		ChargeMontage = nullptr;
 	}
 }
 
 void APogoStickEquipment::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+	ReleaseFirstPersonHold();
 	StopChargeSound();
 	ShowChargeWidget(false);
 	SetLandedBound(false);
+	bBounceProtected = false;
 	SetAirborneFromLaunch(false, false);
+	UpdateFallProtection();
 	Super::EndPlay(EndPlayReason);
 }
 
@@ -169,14 +402,21 @@ void APogoStickEquipment::LoadArt()
 	SpringMesh->SetStaticMesh(spring);
 	FootMesh->SetStaticMesh(foot);
 
-	// No first-person (panini) materials: built against the SML project's placeholder
-	// MPC_Panini they cook with a shader map ID the game never finds, and render as the default
-	// checker material. See Tools/import_art.py.
+	if (!bPlaceholders)
+	{
+		RegisterFirstPersonMaterials();
+	}
 
-	ChargeSound = LoadOptional<USoundBase>(PogoStickAssets::ChargeSound);
+	ChargeClicks.Reset();
+	for (int32 i = 0; i < static_cast<int32>(UE_ARRAY_COUNT(PogoStickAssets::ChargeClickPositions)); ++i)
+	{
+		const FString name = FString::Printf(TEXT("%s%02d"), PogoStickAssets::ChargeClickPrefix, i + 1);
+		ChargeClicks.Add(LoadOptional<USoundBase>(*FString::Printf(TEXT("%s/%s.%s"), PogoStickAssets::ChargeClickFolder, *name, *name)));
+	}
 	LaunchSound = LoadOptional<USoundBase>(PogoStickAssets::LaunchSound);
 	CancelSound = LoadOptional<USoundBase>(PogoStickAssets::CancelSound);
 	JumpPadLaunchSound = LoadOptional<UAkAudioEvent>(PogoStickAssets::JumpPadLaunchSound);
+	ChargeAnimation = LoadOptional<UAnimSequence>(PogoStickAssets::ChargeAnimation);
 
 	LayOutParts(bPlaceholders);
 }
@@ -249,7 +489,8 @@ void APogoStickEquipment::LayOutParts(bool bPlaceholders)
 
 void APogoStickEquipment::UpdateSpringVisual(float ChargeAlpha)
 {
-	const float squash = 1.0f - ActiveSpringCompression * FMath::Clamp(ChargeAlpha, 0.0f, 1.0f);
+	// Kept just above zero: a mesh scaled flat has no usable normals.
+	const float squash = FMath::Max(0.02f, 1.0f - ActiveSpringCompression * FMath::Clamp(ChargeAlpha, 0.0f, 1.0f));
 	SpringPivot->SetRelativeLocation(PartsOffset + FVector(0.0f, 0.0f, SpringTopZ));
 	SpringPivot->SetRelativeScale3D(FVector(1.0f, 1.0f, squash));
 	FootPivot->SetRelativeLocation(PartsOffset + FVector(0.0f, 0.0f, SpringTopZ - SpringHeight * squash));
@@ -258,8 +499,17 @@ void APogoStickEquipment::UpdateSpringVisual(float ChargeAlpha)
 void APogoStickEquipment::Equip(AFGCharacterPlayer* Character)
 {
 	LoadArt();
-	UpdateHoldAdjust(FPogoStickSettings::Read(this));
 	Super::Equip(Character);
+	LastEquippedCharacter = Character;
+
+	// Safety net: a no-fall-damage curve left behind by another Pogo Stick would otherwise
+	// protect the player for good. If one is there while nothing is being protected, remove it.
+	FObjectProperty* overrideProperty = GetFallDamageOverrideProperty();
+	if (HasAuthority() && Character != nullptr && overrideProperty != nullptr && !bNoFallDamageApplied
+		&& IsNoFallDamageCurve(overrideProperty->GetObjectPropertyValue_InContainer(Character)))
+	{
+		Character->SetFallDamageOverride(nullptr);
+	}
 	UpdateArmAnimation(GetInstigatorCameraMode());
 	bCharging = false;
 	UpdateSpringVisual(0.0f);
@@ -284,21 +534,15 @@ void APogoStickEquipment::UnEquip()
 	{
 		CancelCharging();
 	}
+	ReleaseFirstPersonHold();
 	ShowChargeWidget(false);
 	SetLandedBound(false);
 	bServerBounceEnabled = false;
+	bBounceProtected = false;
+	UpdateFallProtection();
 
-	// Leave the no-fall-damage protection in place if the player swaps tools mid-air; Tick
-	// keeps checking for the landing. Only drop it here if they're already on the ground.
-	if (HasAuthority() && bAwaitingLanding)
-	{
-		const AFGCharacterPlayer* player = GetInstigatorCharacter();
-		const UFGCharacterMovementComponent* movement = player != nullptr ? player->GetFGMovementComponent() : nullptr;
-		if (movement == nullptr || movement->IsMovingOnGround())
-		{
-			SetAirborneFromLaunch(false, false);
-		}
-	}
+	// Putting the stick away ends the launch's protection, even mid-air: no stick, no help.
+	SetAirborneFromLaunch(false, false);
 
 	Super::UnEquip();
 }
@@ -346,14 +590,11 @@ void APogoStickEquipment::Tick(float DeltaSeconds)
 		ChargeElapsed += DeltaSeconds;
 		const float alpha = FMath::Clamp(ChargeElapsed / ActiveChargeTime, 0.0f, 1.0f);
 		UpdateSpringVisual(alpha);
+		PlayDueChargeClick();
 
 		const FPogoStickSettings settings = FPogoStickSettings::Read(this);
 		FVector launchDirection;
 		const bool bSurfaceInRange = FindPushSurface(settings, launchDirection);
-		if (ChargeWidget != nullptr)
-		{
-			ChargeWidget->SetCharge(alpha, bSurfaceInRange);
-		}
 
 		// A full charge is held until there's something to push off.
 		if (alpha >= 1.0f && settings.bAutoLaunch && bSurfaceInRange)
@@ -368,22 +609,30 @@ void APogoStickEquipment::Tick(float DeltaSeconds)
 		TickBounceLocal(settings);
 		UpdatePushPointMarker();
 		// Live, so the hold position can be tuned from the mod settings while looking at it.
-		UpdateHoldAdjust(settings);
+		UpdateHold(settings, DeltaSeconds);
+		UpdateChargeAim(settings, DeltaSeconds);
 	}
 	if (HasAuthority())
 	{
 		TickBounceServer();
 	}
 
-	if (bAwaitingLanding && HasAuthority())
+	TickAwaitingLanding(DeltaSeconds);
+}
+
+void APogoStickEquipment::TickAwaitingLanding(float DeltaSeconds)
+{
+	if (!bAwaitingLanding || !HasAuthority())
 	{
-		AirborneTime += DeltaSeconds;
-		const AFGCharacterPlayer* player = GetInstigatorCharacter();
-		const UFGCharacterMovementComponent* movement = player != nullptr ? player->GetFGMovementComponent() : nullptr;
-		if (movement == nullptr || (AirborneTime > MinAirborneTime && movement->IsMovingOnGround()))
-		{
-			SetAirborneFromLaunch(false, false);
-		}
+		return;
+	}
+
+	AirborneTime += DeltaSeconds;
+	const AFGCharacterPlayer* player = GetProtectedCharacter();
+	const UFGCharacterMovementComponent* movement = player != nullptr ? player->GetFGMovementComponent() : nullptr;
+	if (movement == nullptr || (AirborneTime > MinAirborneTime && movement->IsMovingOnGround()))
+	{
+		SetAirborneFromLaunch(false, false);
 	}
 }
 
@@ -401,18 +650,10 @@ void APogoStickEquipment::StartCharging()
 	bCharging = true;
 
 	ShowChargeWidget(true);
-	if (ChargeWidget != nullptr)
-	{
-		ChargeWidget->SetCharge(0.0f);
-		ChargeWidget->SetChargeVisible(true);
-	}
 
 	StopChargeSound();
-	if (ChargeSound != nullptr)
-	{
-		const float pitch = FMath::Clamp(AuthoredChargeTime / ActiveChargeTime, 0.25f, 4.0f);
-		ChargeAudio = UGameplayStatics::SpawnSound2D(this, ChargeSound, 1.0f, pitch);
-	}
+	NextChargeClick = 0;
+	PlayDueChargeClick();
 }
 
 void APogoStickEquipment::CancelCharging()
@@ -420,10 +661,6 @@ void APogoStickEquipment::CancelCharging()
 	bCharging = false;
 	ChargeElapsed = 0.0f;
 	UpdateSpringVisual(0.0f);
-	if (ChargeWidget != nullptr)
-	{
-		ChargeWidget->SetChargeVisible(false);
-	}
 	StopChargeSound();
 	PlaySound2D(CancelSound);
 }
@@ -485,6 +722,24 @@ void APogoStickEquipment::UpdatePushPointMarker()
 	const bool bVisible = settings.bShowPushPoint && hit.bBlockingHit && controller != nullptr
 		&& UWidgetLayoutLibrary::ProjectWorldLocationToWidgetPosition(controller, hit.ImpactPoint, screenPosition, false);
 	ChargeWidget->SetPushPoint(bVisible, screenPosition, hit.Distance / 100.0f, bInRange, settings.bShowPushDistance);
+
+	if (settings.bShowCrosshairIndicator && CooldownRemaining > 0.0f)
+	{
+		ChargeWidget->SetCrosshairState(EPogoCrosshairState::Cooldown);
+	}
+	else if (!settings.bShowCrosshairIndicator)
+	{
+		ChargeWidget->SetCrosshairState(EPogoCrosshairState::None);
+	}
+	else if (bInRange)
+	{
+		ChargeWidget->SetCrosshairState(EPogoCrosshairState::Ready);
+	}
+	else
+	{
+		const bool bFullyCharged = bCharging && ChargeElapsed >= ActiveChargeTime;
+		ChargeWidget->SetCrosshairState(bFullyCharged ? EPogoCrosshairState::ChargedNoSurface : EPogoCrosshairState::None);
+	}
 }
 
 void APogoStickEquipment::Launch(const FVector& Direction)
@@ -492,10 +747,6 @@ void APogoStickEquipment::Launch(const FVector& Direction)
 	bCharging = false;
 	ChargeElapsed = 0.0f;
 	UpdateSpringVisual(0.0f);
-	if (ChargeWidget != nullptr)
-	{
-		ChargeWidget->SetChargeVisible(false);
-	}
 	StopChargeSound();
 
 	AFGCharacterPlayer* player = GetInstigatorCharacter();
@@ -544,8 +795,7 @@ void APogoStickEquipment::SetAirborneFromLaunch(bool bAirborne, bool bNoFallDama
 		return;
 	}
 
-	AFGCharacterPlayer* player = GetInstigatorCharacter();
-	FObjectProperty* overrideProperty = GetFallDamageOverrideProperty();
+	AFGCharacterPlayer* player = GetProtectedCharacter();
 
 	if (bAirborne)
 	{
@@ -562,26 +812,9 @@ void APogoStickEquipment::SetAirborneFromLaunch(bool bAirborne, bool bNoFallDama
 			}
 		}
 
-		if (bNoFallDamage && player != nullptr && overrideProperty != nullptr)
-		{
-			// Another piece of equipment (e.g. Blade Runners) may already have its own curve set.
-			// Remember it so it comes back after landing, but don't remember our own curve.
-			UCurveFloat* current = Cast<UCurveFloat>(overrideProperty->GetObjectPropertyValue_InContainer(player));
-			if (!bAwaitingLanding || current != NoFallDamageCurve)
-			{
-				PreviousFallDamageOverride = current;
-			}
-
-			if (NoFallDamageCurve == nullptr)
-			{
-				NoFallDamageCurve = NewObject<UCurveFloat>(this, TEXT("PogoNoFallDamage"), RF_Transient);
-				NoFallDamageCurve->FloatCurve.AddKey(0.0f, 0.0f);
-				NoFallDamageCurve->FloatCurve.AddKey(100000.0f, 0.0f);
-			}
-			player->SetFallDamageOverride(NoFallDamageCurve);
-		}
-
 		bAwaitingLanding = true;
+		bLaunchNoFallDamage = bNoFallDamage;
+		UpdateFallProtection();
 		return;
 	}
 
@@ -590,14 +823,9 @@ void APogoStickEquipment::SetAirborneFromLaunch(bool bAirborne, bool bNoFallDama
 		return;
 	}
 	bAwaitingLanding = false;
+	bLaunchNoFallDamage = false;
 
-	if (player == nullptr)
-	{
-		PreviousFallDamageOverride = nullptr;
-		return;
-	}
-
-	if (!IsLocalInstigator())
+	if (player != nullptr && !IsLocalInstigator())
 	{
 		if (UFGCharacterMovementComponent* movement = player->GetFGMovementComponent())
 		{
@@ -605,15 +833,64 @@ void APogoStickEquipment::SetAirborneFromLaunch(bool bAirborne, bool bNoFallDama
 			movement->bServerAcceptClientAuthoritativePosition = false;
 		}
 	}
+	UpdateFallProtection();
+}
+
+void APogoStickEquipment::UpdateFallProtection()
+{
+	// A charged launch protects until the next landing (the No Fall Damage setting). A bounce
+	// protects only while the client says the coming landing would bounce, so cancelling the
+	// bounce (crouch or Primary Fire held, or not aiming at the ground) means normal fall damage.
+	SetNoFallDamage((bAwaitingLanding && bLaunchNoFallDamage) || bBounceProtected);
+}
+
+AFGCharacterPlayer* APogoStickEquipment::GetProtectedCharacter() const
+{
+	AFGCharacterPlayer* player = GetInstigatorCharacter();
+	return player != nullptr ? player : LastEquippedCharacter.Get();
+}
+
+void APogoStickEquipment::SetNoFallDamage(bool bEnabled)
+{
+	if (!HasAuthority() || bEnabled == bNoFallDamageApplied)
+	{
+		return;
+	}
+	AFGCharacterPlayer* player = GetProtectedCharacter();
+	FObjectProperty* overrideProperty = GetFallDamageOverrideProperty();
+	if (player == nullptr || overrideProperty == nullptr)
+	{
+		bNoFallDamageApplied = false;
+		PreviousFallDamageOverride = nullptr;
+		return;
+	}
+
+	if (bEnabled)
+	{
+		// Another piece of equipment (e.g. Blade Runners) may already have its own curve set.
+		// Remember it so it comes back afterwards, but never another Pogo Stick's curve, or
+		// restoring it would leave the player protected.
+		UObject* current = overrideProperty->GetObjectPropertyValue_InContainer(player);
+		PreviousFallDamageOverride = IsNoFallDamageCurve(current) ? nullptr : Cast<UCurveFloat>(current);
+		if (NoFallDamageCurve == nullptr)
+		{
+			NoFallDamageCurve = NewObject<UCurveFloat>(this, NoFallDamageCurveName, RF_Transient);
+			NoFallDamageCurve->FloatCurve.AddKey(0.0f, 0.0f);
+			NoFallDamageCurve->FloatCurve.AddKey(100000.0f, 0.0f);
+		}
+		player->SetFallDamageOverride(NoFallDamageCurve);
+		bNoFallDamageApplied = true;
+		return;
+	}
 
 	// Only restore if our curve is still the active one; if something else replaced it
 	// meanwhile, that newer override wins.
-	if (overrideProperty != nullptr && NoFallDamageCurve != nullptr
-		&& overrideProperty->GetObjectPropertyValue_InContainer(player) == NoFallDamageCurve)
+	if (overrideProperty->GetObjectPropertyValue_InContainer(player) == NoFallDamageCurve)
 	{
 		player->SetFallDamageOverride(PreviousFallDamageOverride);
 	}
 	PreviousFallDamageOverride = nullptr;
+	bNoFallDamageApplied = false;
 }
 
 void APogoStickEquipment::SetLandedBound(bool bBound)
@@ -644,12 +921,17 @@ void APogoStickEquipment::TickBounceLocal(const FPogoStickSettings& Settings)
 		LastFallVelocity = movement->Velocity;
 	}
 
+	// Whether landing now would bounce, as far as the client can tell before the landing: the
+	// same conditions OnOwnerLanded checks, minus the fall speed, which the server measures.
 	const float minSpeed = Settings.MinBounceSpeed * 100.0f;
-	if (Settings.bBounceOnLanding == bSentBounceEnabled && FMath::IsNearlyEqual(minSpeed, SentMinBounceSpeed))
+	FVector unusedDirection;
+	const bool bWouldBounce = Settings.bBounceOnLanding && !bCharging && !IsCrouchHeld()
+		&& FindPushSurface(Settings, unusedDirection);
+	if (bWouldBounce == bSentBounceEnabled && FMath::IsNearlyEqual(minSpeed, SentMinBounceSpeed))
 	{
 		return;
 	}
-	bSentBounceEnabled = Settings.bBounceOnLanding;
+	bSentBounceEnabled = bWouldBounce;
 	SentMinBounceSpeed = minSpeed;
 
 	if (HasAuthority())
@@ -671,19 +953,23 @@ void APogoStickEquipment::Server_SetBounceSettings_Implementation(bool bEnabled,
 
 void APogoStickEquipment::TickBounceServer()
 {
-	if (!bServerBounceEnabled || bAwaitingLanding)
-	{
-		return;
-	}
-
 	const AFGCharacterPlayer* player = GetInstigatorCharacter();
 	const UFGCharacterMovementComponent* movement = player != nullptr ? player->GetFGMovementComponent() : nullptr;
-	// Slightly below the client's threshold: the server's view of the fall speed can lag, and
-	// protecting a landing that ends up not bouncing only means no fall damage.
-	if (movement != nullptr && movement->IsFalling() && -movement->Velocity.Z >= ServerMinBounceSpeed * 0.9f)
-	{
-		SetAirborneFromLaunch(true, true);
-	}
+	// Fall damage is decided on the server as the player lands, before a bounce RPC could
+	// arrive, so protect any fast fall the client says would bounce. Slightly below the client's
+	// threshold: the server's view of the fall speed can lag. Dropped once the player is off the
+	// fall, which is after the landing's damage has been decided.
+	bBounceProtected = bServerBounceEnabled && movement != nullptr && movement->IsFalling()
+		&& -movement->Velocity.Z >= ServerMinBounceSpeed * 0.9f;
+	UpdateFallProtection();
+}
+
+bool APogoStickEquipment::IsCrouchHeld() const
+{
+	// bWantsToCrouch covers crouch being held while the game refuses to crouch mid-air.
+	const AFGCharacterPlayer* player = GetInstigatorCharacter();
+	const UFGCharacterMovementComponent* movement = player != nullptr ? player->GetFGMovementComponent() : nullptr;
+	return player != nullptr && (player->bIsCrouched || (movement != nullptr && movement->bWantsToCrouch));
 }
 
 void APogoStickEquipment::OnOwnerLanded(const FHitResult& Hit)
@@ -697,13 +983,11 @@ void APogoStickEquipment::OnOwnerLanded(const FHitResult& Hit)
 		return;
 	}
 
-	// Holding Primary Fire (charging) or crouching as you land means "stop here". bWantsToCrouch
-	// covers crouch being held while the game refuses to actually crouch mid-air.
-	const UFGCharacterMovementComponent* movement = player->GetFGMovementComponent();
-	const bool bCrouching = player->bIsCrouched || (movement != nullptr && movement->bWantsToCrouch);
+	// Holding Primary Fire (charging) or crouching as you land means "stop here", with normal
+	// fall damage: the server only protects landings this client reported as bouncing.
 	const FPogoStickSettings settings = FPogoStickSettings::Read(this);
 	const float fallSpeed = -fallVelocity.Z;
-	if (!settings.bBounceOnLanding || bCharging || bCrouching || fallSpeed < settings.MinBounceSpeed * 100.0f)
+	if (!settings.bBounceOnLanding || bCharging || IsCrouchHeld() || fallSpeed < settings.MinBounceSpeed * 100.0f)
 	{
 		return;
 	}
@@ -727,13 +1011,15 @@ void APogoStickEquipment::OnOwnerLanded(const FHitResult& Hit)
 	player->LaunchCharacter(bounceVelocity, true, true);
 	PlayLaunchSound();
 
+	// No launch protection for the bounce's own flight: its landing is protected only if that
+	// one would bounce too, so it can be cancelled like any other.
 	if (HasAuthority())
 	{
-		SetAirborneFromLaunch(true, true);
+		SetAirborneFromLaunch(true, false);
 	}
 	else
 	{
-		Server_Launch(bounceVelocity, true, true);
+		Server_Launch(bounceVelocity, true, false);
 	}
 
 	UE_LOG(LogPogoStick, Verbose, TEXT("Bounced: fall %.0f cm/s -> up %.0f cm/s"), fallSpeed, upSpeed);
@@ -767,7 +1053,26 @@ void APogoStickEquipment::ShowChargeWidget(bool bShow)
 	if (ChargeWidget != nullptr)
 	{
 		ChargeWidget->AddToPlayerScreen(10);
-		ChargeWidget->SetCharge(0.0f);
+	}
+}
+
+void APogoStickEquipment::PlayDueChargeClick()
+{
+	if (!IsLocalInstigator())
+	{
+		return;
+	}
+	const float alpha = ChargeElapsed / FMath::Max(0.1f, ActiveChargeTime);
+	// On a short charge several clicks fall due in one frame. Play only the latest: stacking
+	// them would turn a dozen clicks into one loud bang. The last one, at full charge, always plays.
+	int32 due = INDEX_NONE;
+	while (NextChargeClick < ChargeClicks.Num() && PogoStickAssets::ChargeClickPositions[NextChargeClick] <= alpha)
+	{
+		due = NextChargeClick++;
+	}
+	if (due != INDEX_NONE && ChargeClicks[due] != nullptr)
+	{
+		ChargeAudio = UGameplayStatics::SpawnSound2D(this, ChargeClicks[due]);
 	}
 }
 
@@ -775,7 +1080,7 @@ void APogoStickEquipment::StopChargeSound()
 {
 	if (ChargeAudio != nullptr)
 	{
-		ChargeAudio->Stop();
+		ChargeAudio->FadeOut(ChargeSoundFadeTime, 0.0f);
 		ChargeAudio = nullptr;
 	}
 }

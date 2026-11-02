@@ -19,7 +19,7 @@ public:
 struct POGOSTICK_API FPogoStickSettings
 {
 	/// Seconds Primary Fire must be held before the stick is fully charged.
-	float ChargeTime = 2.0f;
+	float ChargeTime = 1.0f;
 	/// Launch speed in metres per second.
 	float LaunchSpeed = 25.0f;
 	/// How close (m) the surface you're looking at must be to push off it.
@@ -33,7 +33,7 @@ struct POGOSTICK_API FPogoStickSettings
 	/// No fall damage between a launch and the next landing.
 	bool bNoFallDamage = true;
 	/// How far the spring visibly squashes at full charge, 0 to 0.9 of its length.
-	float SpringCompression = 0.5f;
+	float SpringCompression = 1.0f;
 	/// Bounce back up when landing hard while the stick is equipped.
 	bool bBounceOnLanding = true;
 	/// Fraction of the landing speed kept by a bounce. Below 1, bounces die down.
@@ -44,6 +44,9 @@ struct POGOSTICK_API FPogoStickSettings
 	bool bShowPushPoint = true;
 	/// The distance readout next to that marker.
 	bool bShowPushDistance = true;
+	/// Ring around the crosshair: green with a surface in reach, blue when fully charged with nothing in reach,
+	/// orange during the cooldown.
+	bool bShowCrosshairIndicator = true;
 	/// Where the stick sits relative to the hand socket (cm, socket axes), and its rotation.
 	/// Y +22.5 tuned in game (2026-11-01) with the Rebar Gun arm pose, still used in first person.
 	FVector HoldOffset = FVector(0.0f, 22.5f, 0.0f);
