@@ -85,7 +85,8 @@ UPogoStickRecipe::UPogoStickRecipe()
 {
 	mDisplayNameOverride = false;
 	mProduct.Add(FItemAmount(UPogoStickDescriptor::StaticClass(), 1));
-	mManufactoringDuration = 4.0f;
+	// 10 hammers in the Equipment Workshop (4 s each), like the Parachute or Zipline.
+	mManufactoringDuration = 40.0f;
 	mManualManufacturingMultiplier = 1.0f;
 	mProducedIn.Add(TSoftClassPtr<UObject>(FSoftObjectPath(WorkshopComponentPath)));
 }
