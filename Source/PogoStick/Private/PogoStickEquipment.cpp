@@ -20,6 +20,7 @@
 #include "PogoStick.h"
 #include "PogoStickAssets.h"
 #include "PogoStickConfiguration.h"
+#include "Sound/SoundAttenuation.h"
 #include "Sound/SoundBase.h"
 #include "UObject/UnrealType.h"
 #include "Components/SkeletalMeshComponent.h"
@@ -59,6 +60,13 @@ const TCHAR* NoFallDamageCurveName = TEXT("PogoNoFallDamage");
 bool IsNoFallDamageCurve(const UObject* Curve)
 {
 	return Curve != nullptr && Curve->GetFName() == FName(NoFallDamageCurveName);
+}
+
+FObjectProperty* GetCurrentEmoteProperty()
+{
+	// Private on AFGCharacterPlayer, with no getter. Set when an emote is played.
+	static FObjectProperty* property = FindFProperty<FObjectProperty>(AFGCharacterPlayer::StaticClass(), TEXT("mCurrentEmote"));
+	return property;
 }
 
 FObjectProperty* GetFallDamageOverrideProperty()
@@ -318,9 +326,18 @@ void APogoStickEquipment::UpdateHold(const FPogoStickSettings& Settings, float D
 		HoldAdjust->SetRelativeTransform(hold);
 	}
 
-	// Both hands on the grips: the hold animation, frozen at the frame matching the push. Played
-	// again whenever something else in the slot (an emote, say) has replaced it.
-	if (ChargeMontage == nullptr || !anim->Montage_IsPlaying(ChargeMontage))
+	// Both hands on the grips: the hold animation, frozen at the frame matching the push. When
+	// something else (an emote, say) has replaced it, wait for that to finish before taking the
+	// hands back: restarting straight away would cut the emote off after a single frame.
+	if (ChargeMontage != nullptr && !anim->Montage_IsPlaying(ChargeMontage))
+	{
+		ChargeMontage = nullptr;
+	}
+	if (ChargeMontage == nullptr && anim->IsAnyMontagePlaying())
+	{
+		return;
+	}
+	if (ChargeMontage == nullptr)
 	{
 		ChargeMontage = anim->PlaySlotAnimationAsDynamicMontage(ChargeAnimation, PogoStickAssets::ChargeAnimationSlot,
 			HoldBlendTime, HoldBlendTime);
@@ -363,6 +380,7 @@ void APogoStickEquipment::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
 	ReleaseFirstPersonHold();
 	StopChargeSound();
+	StopRemoteCharge();
 	ShowChargeWidget(false);
 	SetLandedBound(false);
 	bBounceProtected = false;
@@ -534,6 +552,7 @@ void APogoStickEquipment::UnEquip()
 	{
 		CancelCharging();
 	}
+	SetHiddenForEmote(false);
 	ReleaseFirstPersonHold();
 	ShowChargeWidget(false);
 	SetLandedBound(false);
@@ -559,7 +578,11 @@ void APogoStickEquipment::HandleDefaultEquipmentActionEvent(EDefaultEquipmentAct
 
 	if (ActionEvent == EDefaultEquipmentActionEvent::Pressed)
 	{
-		StartCharging();
+		// No charging a stick that's been put away for an emote.
+		if (!bHiddenForEmote)
+		{
+			StartCharging();
+		}
 	}
 	else if (bCharging)
 	{
@@ -582,8 +605,10 @@ void APogoStickEquipment::Tick(float DeltaSeconds)
 	Super::Tick(DeltaSeconds);
 
 	UpdateArmAnimation(GetInstigatorCameraMode());
+	UpdateEmoteHide();
 
 	CooldownRemaining = FMath::Max(0.0f, CooldownRemaining - DeltaSeconds);
+	TickRemoteCharge(DeltaSeconds);
 
 	if (bCharging)
 	{
@@ -636,6 +661,67 @@ void APogoStickEquipment::TickAwaitingLanding(float DeltaSeconds)
 	}
 }
 
+bool APogoStickEquipment::IsHolderEmoting() const
+{
+	const AFGCharacterPlayer* player = GetInstigatorCharacter();
+	if (player == nullptr)
+	{
+		return false;
+	}
+	// An emote has been played at some point. The property isn't cleared when it ends, so the
+	// montage check below decides whether it's still going. If a game update renames it, fall
+	// back to the montage check alone rather than never hiding.
+	if (const FObjectProperty* emoteProperty = GetCurrentEmoteProperty())
+	{
+		if (emoteProperty->GetObjectPropertyValue_InContainer(player) == nullptr)
+		{
+			return false;
+		}
+	}
+	auto hasForeignMontage = [this](const USkeletalMeshComponent* mesh)
+	{
+		const UAnimInstance* anim = mesh != nullptr ? mesh->GetAnimInstance() : nullptr;
+		const UAnimMontage* montage = anim != nullptr ? anim->GetCurrentActiveMontage() : nullptr;
+		return montage != nullptr && montage != ChargeMontage;
+	};
+	return hasForeignMontage(player->GetMesh()) || hasForeignMontage(player->Get3PMesh());
+}
+
+void APogoStickEquipment::UpdateEmoteHide()
+{
+	const bool bEmoting = IsHolderEmoting();
+	if (bEmoting == bHiddenForEmote)
+	{
+		return;
+	}
+	if (bEmoting && bCharging)
+	{
+		// Quietly: the emote has its own sound.
+		bCharging = false;
+		ChargeElapsed = 0.0f;
+		UpdateSpringVisual(0.0f);
+		StopChargeSound();
+		BroadcastSoundEvent(EPogoSoundEvent::ChargeStopQuiet);
+	}
+	SetHiddenForEmote(bEmoting);
+}
+
+void APogoStickEquipment::SetHiddenForEmote(bool bHide)
+{
+	if (bHide == bHiddenForEmote)
+	{
+		return;
+	}
+	bHiddenForEmote = bHide;
+	// Every visible part hangs off HoldAdjust. The actor's own hidden flag is left to the game.
+	HoldAdjust->SetHiddenInGame(bHide, true);
+	if (bHide && ChargeWidget != nullptr)
+	{
+		ChargeWidget->SetPushPoint(false, FVector2D::ZeroVector, 0.0f, false, false);
+		ChargeWidget->SetCrosshairState(EPogoCrosshairState::None);
+	}
+}
+
 void APogoStickEquipment::StartCharging()
 {
 	if (bCharging || CooldownRemaining > 0.0f)
@@ -654,6 +740,7 @@ void APogoStickEquipment::StartCharging()
 	StopChargeSound();
 	NextChargeClick = 0;
 	PlayDueChargeClick();
+	BroadcastSoundEvent(EPogoSoundEvent::ChargeStart, ActiveChargeTime);
 }
 
 void APogoStickEquipment::CancelCharging()
@@ -663,6 +750,7 @@ void APogoStickEquipment::CancelCharging()
 	UpdateSpringVisual(0.0f);
 	StopChargeSound();
 	PlaySound2D(CancelSound);
+	BroadcastSoundEvent(EPogoSoundEvent::ChargeCancel);
 }
 
 bool APogoStickEquipment::FindPushSurface(const FPogoStickSettings& Settings, FVector& OutLaunchDirection,
@@ -703,7 +791,8 @@ bool APogoStickEquipment::FindPushSurface(const FPogoStickSettings& Settings, FV
 
 void APogoStickEquipment::UpdatePushPointMarker()
 {
-	if (ChargeWidget == nullptr)
+	// Cleared by SetHiddenForEmote; no marker for a stick that's put away.
+	if (ChargeWidget == nullptr || bHiddenForEmote)
 	{
 		return;
 	}
@@ -1062,18 +1151,23 @@ void APogoStickEquipment::PlayDueChargeClick()
 	{
 		return;
 	}
-	const float alpha = ChargeElapsed / FMath::Max(0.1f, ActiveChargeTime);
-	// On a short charge several clicks fall due in one frame. Play only the latest: stacking
-	// them would turn a dozen clicks into one loud bang. The last one, at full charge, always plays.
-	int32 due = INDEX_NONE;
-	while (NextChargeClick < ChargeClicks.Num() && PogoStickAssets::ChargeClickPositions[NextChargeClick] <= alpha)
-	{
-		due = NextChargeClick++;
-	}
+	const int32 due = TakeDueChargeClick(ChargeElapsed / FMath::Max(0.1f, ActiveChargeTime), NextChargeClick);
 	if (due != INDEX_NONE && ChargeClicks[due] != nullptr)
 	{
 		ChargeAudio = UGameplayStatics::SpawnSound2D(this, ChargeClicks[due]);
 	}
+}
+
+int32 APogoStickEquipment::TakeDueChargeClick(float ChargeAlpha, int32& NextClick) const
+{
+	// On a short charge several clicks fall due in one frame. Take only the latest: stacking
+	// them would turn a dozen clicks into one loud bang. The last one, at full charge, always plays.
+	int32 due = INDEX_NONE;
+	while (NextClick < ChargeClicks.Num() && PogoStickAssets::ChargeClickPositions[NextClick] <= ChargeAlpha)
+	{
+		due = NextClick++;
+	}
+	return due;
 }
 
 void APogoStickEquipment::StopChargeSound()
@@ -1085,9 +1179,10 @@ void APogoStickEquipment::StopChargeSound()
 	}
 }
 
-void APogoStickEquipment::PlayLaunchSound() const
+void APogoStickEquipment::PlayLaunchSound()
 {
 	PlaySound2D(LaunchSound);
+	BroadcastSoundEvent(EPogoSoundEvent::Launch);
 	// Played where the player is, like a Jump Pad under their feet. The game's Wwise build only
 	// exposes the PostAkEvent* functions; PostEvent is compiled out.
 	const AFGCharacterPlayer* player = GetInstigatorCharacter();
@@ -1103,4 +1198,135 @@ void APogoStickEquipment::PlaySound2D(USoundBase* Sound) const
 	{
 		UGameplayStatics::PlaySound2D(this, Sound);
 	}
+}
+
+void APogoStickEquipment::BroadcastSoundEvent(EPogoSoundEvent Event, float ChargeTime)
+{
+	if (!IsLocalInstigator())
+	{
+		return;
+	}
+	if (HasAuthority())
+	{
+		Multicast_SoundEvent(Event, ChargeTime);
+	}
+	else
+	{
+		Server_SoundEvent(Event, ChargeTime);
+	}
+}
+
+void APogoStickEquipment::Server_SoundEvent_Implementation(EPogoSoundEvent Event, float ChargeTime)
+{
+	// Only the holder may speak for the stick.
+	if (GetInstigatorCharacter() == nullptr)
+	{
+		return;
+	}
+	Multicast_SoundEvent(Event, FMath::Clamp(ChargeTime, 0.1f, 60.0f));
+}
+
+void APogoStickEquipment::Multicast_SoundEvent_Implementation(EPogoSoundEvent Event, float ChargeTime)
+{
+	// The holder heard it already, in 2D; a dedicated server has nobody listening.
+	if (IsLocalInstigator() || GetNetMode() == NM_DedicatedServer)
+	{
+		return;
+	}
+
+	switch (Event)
+	{
+	case EPogoSoundEvent::ChargeStart:
+		StopRemoteCharge();
+		bRemoteCharging = true;
+		RemoteChargeElapsed = 0.0f;
+		RemoteChargeTime = FMath::Max(0.1f, ChargeTime);
+		NextRemoteChargeClick = 0;
+		TickRemoteCharge(0.0f);
+		break;
+	case EPogoSoundEvent::ChargeCancel:
+		StopRemoteCharge();
+		PlaySoundAtStick(CancelSound);
+		break;
+	case EPogoSoundEvent::ChargeStopQuiet:
+		StopRemoteCharge();
+		break;
+	case EPogoSoundEvent::Launch:
+	{
+		StopRemoteCharge();
+		PlaySoundAtStick(LaunchSound);
+		const AFGCharacterPlayer* player = GetInstigatorCharacter();
+		const FVector location = player != nullptr ? player->GetActorLocation() : GetActorLocation();
+		if (JumpPadLaunchSound != nullptr)
+		{
+			UAkGameplayStatics::PostAkEventAtLocation(GetWorld(), JumpPadLaunchSound, location, FRotator::ZeroRotator);
+		}
+		break;
+	}
+	}
+}
+
+void APogoStickEquipment::TickRemoteCharge(float DeltaSeconds)
+{
+	if (!bRemoteCharging)
+	{
+		return;
+	}
+	RemoteChargeElapsed += DeltaSeconds;
+	if (RemoteChargeElapsed > RemoteChargeTime + RemoteChargeTimeout)
+	{
+		// The launch or cancel never arrived (the events are unreliable); don't squash forever.
+		StopRemoteCharge();
+		return;
+	}
+	const float alpha = FMath::Clamp(RemoteChargeElapsed / RemoteChargeTime, 0.0f, 1.0f);
+	UpdateSpringVisual(alpha);
+	const int32 due = TakeDueChargeClick(alpha, NextRemoteChargeClick);
+	if (due != INDEX_NONE && ChargeClicks[due] != nullptr)
+	{
+		if (UAudioComponent* audio = PlaySoundAtStick(ChargeClicks[due]))
+		{
+			ChargeAudio = audio;
+		}
+	}
+}
+
+void APogoStickEquipment::StopRemoteCharge()
+{
+	if (!bRemoteCharging)
+	{
+		return;
+	}
+	bRemoteCharging = false;
+	RemoteChargeElapsed = 0.0f;
+	UpdateSpringVisual(0.0f);
+	StopChargeSound();
+}
+
+UAudioComponent* APogoStickEquipment::PlaySoundAtStick(USoundBase* Sound)
+{
+	if (Sound == nullptr || Root == nullptr)
+	{
+		return nullptr;
+	}
+	return UGameplayStatics::SpawnSoundAttached(Sound, Root, NAME_None, FVector::ZeroVector, EAttachLocation::KeepRelativeOffset,
+		true, 1.0f, 1.0f, 0.0f, GetRemoteAttenuation());
+}
+
+USoundAttenuation* APogoStickEquipment::GetRemoteAttenuation()
+{
+	// The sound assets carry no attenuation (the holder plays them 2D), so give the other
+	// players' copies one: full volume up close, fading out over roughly a building's length.
+	if (RemoteAttenuation == nullptr)
+	{
+		RemoteAttenuation = NewObject<USoundAttenuation>(this);
+		FSoundAttenuationSettings& settings = RemoteAttenuation->Attenuation;
+		settings.bAttenuate = true;
+		settings.bSpatialize = true;
+		settings.DistanceAlgorithm = EAttenuationDistanceModel::Logarithmic;
+		settings.AttenuationShape = EAttenuationShape::Sphere;
+		settings.AttenuationShapeExtents = FVector(400.0f, 0.0f, 0.0f);
+		settings.FalloffDistance = 4000.0f;
+	}
+	return RemoteAttenuation;
 }

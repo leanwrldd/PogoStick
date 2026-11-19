@@ -11,6 +11,6 @@ DECLARE_LOG_CATEGORY_EXTERN(LogPogoStick, Log, All)
 class FPogoStickModule : public IModuleInterface
 {
 public:
-	virtual void StartupModule() override {}
+	virtual void StartupModule() override;
 	virtual void ShutdownModule() override {}
 };

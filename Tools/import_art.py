@@ -130,6 +130,12 @@ for part in ("Body", "Spring", "Foot"):
         continue
     for index in range(len(mesh.static_materials)):
         mesh.set_material(index, material)
+    if part == "Body":
+        # The dropped item is drawn with this mesh and needs collision to be picked up.
+        import sys
+        sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+        from add_pickup_collision import add_box_collision
+        add_box_collision(mesh)
     eal.save_loaded_asset(mesh, only_if_is_dirty=False)
     box = mesh.get_bounding_box()
     log(f"Mesh {mesh.get_path_name()} slots={len(mesh.static_materials)} "

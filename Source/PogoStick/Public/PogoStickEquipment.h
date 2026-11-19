@@ -11,9 +11,24 @@ class UAudioComponent;
 class UCurveFloat;
 class UMaterialInterface;
 class UPogoChargeWidget;
+class USoundAttenuation;
 class USoundBase;
 class UStaticMeshComponent;
 struct FPogoStickSettings;
+
+/// Sounds the holder's machine relays, through the server, to everyone else.
+UENUM()
+enum class EPogoSoundEvent : uint8
+{
+	/// Charging started; the click series follows the charge time sent with it.
+	ChargeStart,
+	/// Charging was cancelled, with the cancel sound.
+	ChargeCancel,
+	/// Charging stopped without a sound (put away for an emote).
+	ChargeStopQuiet,
+	/// A charged launch or a landing bounce.
+	Launch,
+};
 
 /// The Pogo Stick. Hold Primary Fire to charge; once charged it pushes off the surface the
 /// holder is looking at (if it's within range), launching them the opposite way. While equipped, a hard landing bounces the
@@ -50,6 +65,14 @@ protected:
 	/// server must already know whether this landing is going to bounce.
 	UFUNCTION(Server, Reliable)
 	void Server_SetBounceSettings(bool bEnabled, float MinSpeed);
+
+	/// Owning client to server: relay a sound event to everyone else.
+	UFUNCTION(Server, Unreliable)
+	void Server_SoundEvent(EPogoSoundEvent Event, float ChargeTime);
+
+	/// Everyone but the holder (who already played it) plays the sound in 3D at the stick.
+	UFUNCTION(NetMulticast, Unreliable)
+	void Multicast_SoundEvent(EPogoSoundEvent Event, float ChargeTime);
 
 	UFUNCTION()
 	void OnOwnerLanded(const FHitResult& Hit);
@@ -105,6 +128,16 @@ private:
 	void LayOutParts(bool bPlaceholders);
 	void UpdateSpringVisual(float ChargeAlpha);
 
+	/// The holder is playing an emote: they have one and a montage other than the hold is
+	/// playing on their first- or third-person mesh. Checked on every machine, since each draws
+	/// the stick.
+	bool IsHolderEmoting() const;
+	/// Hides the stick while the holder emotes and shows it again afterwards. Only acts on a
+	/// change, so it never undoes visibility the game set itself.
+	void UpdateEmoteHide();
+	void SetHiddenForEmote(bool bHide);
+	bool bHiddenForEmote = false;
+
 	void StartCharging();
 	void CancelCharging();
 	void Launch(const FVector& Direction);
@@ -127,7 +160,29 @@ private:
 	static constexpr float ChargeSoundFadeTime = 0.15f;
 	void PlaySound2D(USoundBase* Sound) const;
 	/// Owning client: the launch sounds, for both charged launches and landing bounces.
-	void PlayLaunchSound() const;
+	void PlayLaunchSound();
+	/// The index of the latest charge click that the charge (0 to 1) has passed since
+	/// NextClick, advancing NextClick; INDEX_NONE if none.
+	int32 TakeDueChargeClick(float ChargeAlpha, int32& NextClick) const;
+
+	/// Owning client: sends a sound event to the other machines. Every sound the holder hears
+	/// is local and 2D, so without this nobody else hears the stick at all.
+	void BroadcastSoundEvent(EPogoSoundEvent Event, float ChargeTime = 0.0f);
+	/// Other machines: the holder's charge, replayed from its start event for the clicks and
+	/// the spring squash. Ends on the next event or, if that was lost, a while after full charge.
+	void TickRemoteCharge(float DeltaSeconds);
+	void StopRemoteCharge();
+	bool bRemoteCharging = false;
+	float RemoteChargeElapsed = 0.0f;
+	float RemoteChargeTime = 2.0f;
+	int32 NextRemoteChargeClick = 0;
+	static constexpr float RemoteChargeTimeout = 10.0f;
+	/// Other machines: plays Sound in 3D, following the stick.
+	UAudioComponent* PlaySoundAtStick(USoundBase* Sound);
+	USoundAttenuation* GetRemoteAttenuation();
+
+	UPROPERTY(Transient)
+	TObjectPtr<USoundAttenuation> RemoteAttenuation;
 
 	/// Server side. Applies or removes the no-fall-damage curve and client-trusted movement
 	/// for the time between a launch and the next landing.

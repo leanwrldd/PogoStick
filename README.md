@@ -46,8 +46,7 @@ its offset and rotation relative to your hand.
 
 ## Known limitations
 
-- Tested in single player only. Multiplayer and dedicated servers are untested.
-- Only you hear the launch sound. Other players don't.
+- Lightly tested in multiplayer (listen server). Dedicated servers are untested.
 - In third person the character holds the stick with a one-handed pose. The two-handed
   pose scales the character's upper body for equipment added by mods.
 
