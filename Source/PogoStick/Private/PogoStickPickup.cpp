@@ -3,9 +3,7 @@
 #include "Components/BoxComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Engine/StaticMesh.h"
-#include "FGCharacterPlayer.h"
 #include "FGItemPickup_Spawnable.h"
-#include "FGUseableInterface.h"
 #include "Patching/NativeHookManager.h"
 #include "PhysicsEngine/BodySetup.h"
 #include "PogoStick.h"
@@ -112,21 +110,12 @@ void PogoStickPickup::InstallHooks()
 			});
 		});
 
-	// Shows whether the look-at trace ever reaches the dropped stick, and what it decides.
-	SUBSCRIBE_METHOD_VIRTUAL_AFTER(AFGItemPickup_Spawnable::UpdateUseState_Implementation, GetMutableDefault<AFGItemPickup_Spawnable>(),
-		[](AFGItemPickup_Spawnable* self, AFGCharacterPlayer* byCharacter, const FVector& atLocation, UPrimitiveComponent* componentHit, FUseState& out_useState)
-		{
-			static TWeakObjectPtr<AFGItemPickup_Spawnable> lastLogged;
-			if (!IsPogoStickPickup(self) || lastLogged.Get() == self)
-			{
-				return;
-			}
-			lastLogged = self;
-			const TSubclassOf<UFGUseState> state = out_useState.GetState();
-			UE_LOG(LogPogoStick, Log, TEXT("Pickup %s looked at: hit %s, state %s, usable %d"),
-				*self->GetName(), componentHit != nullptr ? *componentHit->GetName() : TEXT("none"),
-				state != nullptr ? *state->GetName() : TEXT("none"), UFGUseState::CanUseInState(state));
-		});
+	// Do NOT hook UpdateUseState_Implementation (or any other IFGUseableInterface method) here.
+	// It is declared on the interface, which sits at a non-zero offset inside the actor (688 bytes
+	// in 1.2). The game calls it through the interface pointer and SML hands that pointer to the
+	// hook unadjusted, so `self` is not the actor and any member access reads garbage. A diagnostic
+	// hook here crashed every player who looked at an item pickup (EXCEPTION_ACCESS_VIOLATION in
+	// AFGCharacterPlayer::UpdateBestUsableActor).
 
 	UE_LOG(LogPogoStick, Log, TEXT("Pickup hooks installed."));
 }
